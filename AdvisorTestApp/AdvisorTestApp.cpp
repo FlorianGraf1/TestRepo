@@ -5,19 +5,19 @@
 #include <vector>
 #include <conio.h>
 
-CRITICAL_SECTION cs;
+const CRITICAL_SECTION cs;
 int counter[50] = { 0 };
 
 void increment() {
         int index = std::rand() % 100;
-//        for (int i = 0; i < 100000; ++i) {
+        for (int i = 0; i < 100000; ++i) {
             EnterCriticalSection(&cs);
            
            int* p = nullptr;
            *p = 42;
-            //throw 1;
+                
             LeaveCriticalSection(&cs);
-//        }
+        }
         EnterCriticalSection(&cs);
         counter[index] = -1;
         LeaveCriticalSection(&cs);
@@ -42,3 +42,4 @@ int main() {
     }
     DeleteCriticalSection(&cs);
 }
+
