@@ -5,7 +5,7 @@
 #include <vector>
 #include <conio.h>
 
-const CRITICAL_SECTION cs;
+CRITICAL_SECTION cs;
 int counter[50] = { 0 };
 
 void increment() {
@@ -42,4 +42,5 @@ int main() {
     }
     DeleteCriticalSection(&cs);
 }
+
 
