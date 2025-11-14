@@ -8,23 +8,34 @@
 CRITICAL_SECTION cs;
 int counter[50] = { 0 };
 
-void increment() {
-        int index = std::rand() % 100;
-        for (int i = 0; i < 100000; ++i) {
-            EnterCriticalSection(&cs);
+class MyClass {
+public:
+    MyClass(int testInt) : _testInt(testInt) {}
+
+private:
+    int _testInt;
+};
+
+int increment() {
+
+    MyClass* testClass = new MyClass(5);
+
+    int index = std::rand() % 100;
+
+    EnterCriticalSection(&cs);
            
-           int* p = nullptr;
-           *p = 42;
-                
-            LeaveCriticalSection(&cs);
-        }
-        EnterCriticalSection(&cs);
-        counter[index] = -1;
-        LeaveCriticalSection(&cs);
+        int* p = nullptr;
+        *p = 42;
+
+    LeaveCriticalSection(&cs);
     
+	delete testClass;
+	return 1;
 }
 
-
+void unusedFunction() {
+    std::cout << "This is an unused function." << std::endl;
+}
 
 int main() {
     InitializeCriticalSection(&cs);
@@ -42,5 +53,3 @@ int main() {
     }
     DeleteCriticalSection(&cs);
 }
-
-
