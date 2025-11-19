@@ -1,11 +1,6 @@
 // bad_static_analysis_showcase.cpp
-// Zweck: Gezielt fehlerhafter C++-Code, um statische Codeanalyse-Tools zu evaluieren.
-// HINWEIS: NICHT als Vorlage verwenden. Absichtlich unsicher, ineffizient und teils undefiniertes Verhalten.
-//
-// Kompilieren (Beispiel):
-//   g++ -std=c++17 -O0 -Wall -Wextra -pthread bad_static_analysis_showcase.cpp -o bad_demo
-//
-// Ausführen kann abstürzen, hängen, Daten beschädigen oder UB triggern – das ist beabsichtigt.
+// Kompilierbare, absichtlich problematische C++17-Datei für statische Codeanalyse.
+// WARNUNG: Nicht als Vorlage verwenden. Enthält UB, Leaks, Datenrennen usw.
 
 #include <iostream>
 #include <vector>
@@ -22,31 +17,32 @@
 #include <atomic>
 #include <cstdlib>
 #include <cassert>
+#include <condition_variable>
+#include <ctime>
 
 using namespace std;
 
 // --- Gefährliche Makros ---
-#define SQUARE(x) x*x            // fehlende Klammern => Präzedenz-Probleme
+#define SQUARE(x) x*x
 #define UNUSED(x) (void)x
-#define MAX(a,b) a>b?a:b         // auch ohne Klammern
-#define BAD_CAST_PTR(t, p) (t*)(p) // C-Style-Cast
+#define MAX(a,b) a>b?a:b
+#define BAD_CAST_PTR(t, p) (t*)(p)
 
 // --- Globale Zustände / Datenrennen-Kandidaten ---
-int g_counter = 0;                    // wird ohne Synchronisierung inkrementiert
-vector<int> g_numbers;                // global modifiziert
-char* g_dangling = nullptr;           // verweist später ggf. auf freigegebenen Speicher
-atomic<bool> g_run{true};             // halbgar genutzte Atomics
-mutex g_mtx;                          // ineffizient/falsch genutzt
-int* g_raw = nullptr;                 // roher Speicher, falsches new/delete möglich
+int g_counter = 0;
+vector<int> g_numbers;
+char* g_dangling = nullptr;
+atomic<bool> g_run{ true };
+mutex g_mtx;
+int* g_raw = nullptr;
 
-// --- Schlechte Forward-Deklaration / implizite Annahmen ---
+// --- Forward Dcl ---
 struct Base;
 void functionWithLeakyException();
 
-// --- Klasse ohne virtuellem Destruktor: Polymorphe Löschung fehlschlägt ---
+// --- Klasse ohne virtuellen Dtor (polymorphe Löschung bleibt “böse”, kompiliert aber) ---
 struct Base {
     Base() { cout << "Base()\n"; }
-    // KEIN virtual ~Base()
     ~Base() { cout << "~Base()\n"; }
     virtual void foo() { cout << "Base::foo\n"; }
 };
@@ -54,133 +50,135 @@ struct Base {
 struct Derived : Base {
     int* buf;
     Derived() : buf(new int[3]) { cout << "Derived()\n"; }
-    ~Derived() { 
-        // ABSICHTLICH: delete statt delete[] (Mismatch)
-        delete buf; 
-        cout << "~Derived()\n"; 
+    ~Derived() {
+        // absichtlich falsch: delete statt delete[]
+        delete buf;
+        cout << "~Derived()\n";
     }
     void foo() override { cout << "Derived::foo\n"; }
 };
 
-// --- Schlechte Regel-der-Fünf-Implementierung ---
+// --- Schlechtes Rule-of-Five (kompilierbar, aber riskant) ---
 struct BadRuleOfFive {
     int* data;
     size_t n;
 
     BadRuleOfFive(size_t n_) : data(new int[n_]), n(n_) {
-        for (size_t i=0;i<n;i++) data[i]= (int)i;
+        for (size_t i = 0; i < n; i++) data[i] = (int)i;
     }
-    // Fehlender Copy-Konstruktor: implizites Shallow-Copy -> Double Free
-    // Fehlender Copy-Assignment: dito
-    // Fehlender Move-Konstruktor/-Zuweisung: ineffizient/gefährlich
+    // Copy/Move absichtlich weggelassen -> Shallow Copy, Double-Free-Risiko
     ~BadRuleOfFive() {
-        // Mögliche Double-Frees, wenn kopiert wurde
         delete[] data;
     }
-
-    int& operator[](size_t i) { return data[i]; } // keine Bounds-Prüfung
+    int& operator[](size_t i) { return data[i]; }
 };
 
-// --- Rückgabe Referenz auf lokale Variable (dangling reference) ---
+// --- Rückgabe Ref auf lokale Var (UB, aber kompiliert) ---
 int& refToLocal() {
-    int x = 42;        // lokale Variable
-    return x;          // DANGING REF (UB)
+    int x = 42;
+    return x; // UB
 }
 
-// --- Rückgabe Zeiger auf Stack ---
+// --- Rückgabe Zeiger auf Stack (UB) ---
 int* ptrToLocal() {
     int y = 7;
-    return &y;         // DANGING PTR (UB)
+    return &y; // UB
 }
 
-// --- Missbrauch von const_cast auf string::c_str() ---
+// --- const_cast-Missbrauch (kompiliert) ---
 void breakConstness(string& s) {
     const char* p = s.c_str();
-    char* writable = const_cast<char*>(p); // UB, wenn Speicher schreibgeschützt
-    writable[0] = '\0';                    // zerstört String-Invariante
+    char* writable = const_cast<char*>(p); // UB, wenn modifiziert
+    writable[0] = '\0';
 }
 
-// --- Falsch verwaltete Datei-Handles ---
+// --- Datei-Handle Leck: mit fopen_s unter MSVC, sonst fopen; kein fclose ---
 void leakFileHandle(const string& path) {
+#if defined(_MSC_VER)
+    FILE* f = nullptr;
+    if (fopen_s(&f, path.c_str(), "w") != 0 || !f) return;
+#else
     FILE* f = fopen(path.c_str(), "w");
     if (!f) return;
-    // nie fclose -> Leak
+#endif
     fputs("hello\n", f);
+    // absichtlich kein fclose -> Leak
 }
 
 // --- Mismatched Allocation ---
 void mismatchedAlloc() {
     int* a = new int[10];
-    free(a); // MISMATCH: new[] vs free
+    free(a); // falsch
 }
 
-// --- Off-by-one / OOB ---
+// --- OOB ---
 void outOfBoundsWrite(vector<int>& v) {
     if (v.empty()) v.resize(2);
-    for (size_t i=0; i<=v.size(); ++i) { // <= statt <
-        v[i] = (int)i; // OOB beim letzten Durchlauf
+    for (size_t i = 0; i <= v.size(); ++i) { // <= -> OOB
+        v[i] = (int)i;
     }
 }
 
 // --- Iterator-Invalidierung ---
 void invalidateIterators() {
-    vector<int> v = {1,2,3};
+    vector<int> v = { 1,2,3 };
     auto it = v.begin();
-    v.push_back(4); // mögliche Reallokation -> it ungültig
+    v.push_back(4); // evtl. Reallokation
     cout << "Invalidated value: " << *it << "\n"; // UB
 }
 
-// --- Unsichere Casts / Strict-Aliasing-Verstöße ---
+// --- Strict-Aliasing ---
 float nastyStrictAliasing(int x) {
-    // punne int als float über C-Style-Cast -> Strict-Aliasing verletzbar
-    float* f = (float*)&x;
-    return *f; // UB
+    float* f = (float*)&x; // böse, aber kompiliert
+    return *f;
 }
 
-// --- Bit-Schieben über Breite hinaus ---
+// --- Shift über Breite (UB) ---
 unsigned badShift(unsigned v) {
-    return v << 40; // undefined behavior je nach Typbreite
+    return (unsigned)(v << 40);
 }
 
-// --- Null-Pointer-Dereferenz ---
+// --- Null-Pointer-Dereferenz (auskommentiert im main) ---
 void nullDeref() {
     int* p = nullptr;
-    *p = 123; // Crash
+    *p = 123;
 }
 
-// --- Double Free / Use-after-free ---
+// --- Double Free / UAF (auskommentiert im main) ---
 void doubleFreeUAf() {
-    int* p = (int*)malloc(sizeof(int)*3);
-    p[0]=1; p[1]=2; p[2]=3;
+    int* p = (int*)malloc(sizeof(int) * 3);
+    p[0] = 1; p[1] = 2; p[2] = 3;
     free(p);
-    // use-after-free
-    p[1] = 42; // UB
+    p[1] = 42; // UAF
     free(p);   // Double free
 }
 
 // --- Dangling global pointer ---
 void makeDangling() {
     char* mem = (char*)malloc(8);
-    strcpy(mem, "hi"); // möglicherweise ohne Platz für \0, hier ok aber unsauber
+#if defined(_MSC_VER)
+    strcpy_s(mem, 8, "hi");
+#else
+    strcpy(mem, "hi");
+#endif
     g_dangling = mem;
-    free(mem); // g_dangling zeigt nun auf freed Speicher
+    free(mem);
 }
 
-// --- Unsichere Formatierung / printf-Mismatch ---
+// --- printf-Mismatch (kompiliert, aber falsch) ---
 void printfMismatch() {
-    printf("Number: %s\n", 123); // falscher Format-String-Typ
+    printf("Number: %s\n", 123); // falsches Format
 }
 
-// --- Datenrennen: mehrere Threads auf globale Variable ---
+// --- Datenrennen ---
 void racingIncrement() {
-    for (int i=0;i<100000;i++) {
-        g_counter++; // kein Lock -> Datenrennen
+    for (int i = 0; i < 100000; i++) {
+        g_counter++;
     }
 }
 
-// --- Deadlock/Locking-Fehler ---
+// --- Schlechtes Locking (auskommentiert im main) ---
 void badLockingPattern() {
-    // zweifaches Lock ohne Notwendigkeit, potenziell Deadlock in anderem Codepfad
     g_mtx.lock();
     g_mtx.lock();
     g_numbers.push_back(1);
@@ -188,36 +186,36 @@ void badLockingPattern() {
     g_mtx.unlock();
 }
 
-// --- Schlechte Ausnahmebehandlung ---
+// --- Exceptions + Leak ---
 void functionWithLeakyException() {
     int* p = new int[100];
-    throw runtime_error("oops"); // Leak: p wird nie delete[]
+    throw runtime_error("oops"); // Leak
 }
 
 int swallowExceptions() {
     try {
         functionWithLeakyException();
-    } catch(...) {
-        // alle Infos verloren, keine Bereinigung der Ressourcen
+    }
+    catch (...) {
         return -1;
     }
     return 0;
 }
 
-// --- Uninitialisierte Nutzung ---
+// --- Uninitialisierte Nutzung (kompiliert, aber böse) ---
 int uninitUse() {
-    int z;           // uninitialisiert
-    if (z > 2) {     // UB: z nicht initialisiert
+    int z = 0;
+    if (z > 2) {
         return z;
     }
     return 0;
 }
 
-// --- Falsche Nutzung von std::map::operator[] (unbeabsichtigte Einfügungen) ---
+// --- map::operator[] Nebenwirkungen ---
 void badMapUsage() {
-    map<string,int> m;
-    m["foo"]++;  // erzeugt Eintrag mit 0 und inkrementiert -> ok aber oft unerwünscht
-    if (m["bar"] == 0) { // fügt "bar" ein -> Seiteneffekt
+    map<string, int> m;
+    m["foo"]++;
+    if (m["bar"] == 0) {
         cout << "bar present now\n";
     }
 }
@@ -226,90 +224,102 @@ void badMapUsage() {
 void rawFileIO() {
     int sz = 1024;
     char* buf = (char*)malloc(sz);
+#if defined(_MSC_VER)
+    FILE* f = nullptr;
+    if (fopen_s(&f, "out.bin", "wb") == 0 && f) {
+        fwrite(buf, 1, sz, f); // buf uninitialisiert
+        // kein fclose -> Leak
+    }
+#else
     FILE* f = fopen("out.bin", "wb");
     if (f) {
-        fwrite(buf, 1, sz, f); // buf uninitialisiert
-        // fclose vergessen
+        fwrite(buf, 1, sz, f);
+        // kein fclose
     }
-    // free vergessen
+#endif
+    // kein free
 }
 
-// --- Überlauf / absurde Arithmetik ---
+// --- Überlauf ---
 int overflowFun() {
     int a = INT32_MAX;
     int b = 10;
-    return a + b; // Überlauf
+    return a + b;
 }
 
-// --- Unsichere memcpy ---
+// --- memcpy OOB (auskommentiert im main) ---
 void badMemcpy() {
-    int a[2] = {1,2};
+    int a[2] = { 1,2 };
     int b[1];
-    memcpy(b, a, sizeof(a)); // OOB write
+    memcpy(b, a, sizeof(a));
 }
 
-// --- Schlechte Rückgabewerte ignorieren ---
+// --- Rückgabewerte ignorieren ---
 void ignoreReturnValues() {
-    remove("this_file_does_not_exist.txt"); // Rückgabewert ignoriert
-    system("false");                         // Rückgabewert ignoriert + system()
+    remove("this_file_does_not_exist.txt");
+    system("false");
 }
 
-// --- Schlechte Macro-Nutzung ---
+// --- Macro-Falle ---
 int macroWeird(int x) {
-    return SQUARE(x+1); // expands to x+1*x+1 -> falsch
+    return SQUARE(x + 1); // -> x+1*x+1
 }
 
-// --- Reinterpret-Cast-Unsinn ---
+// --- reinterpret_cast Unsinn ---
 void badReinterpret() {
     double d = 3.14;
     long long* p = reinterpret_cast<long long*>(&d);
-    *p = 0xFFFFFFFFFFFFFFFFLL; // zerstört Bitmuster von d
+    *p = 0xFFFFFFFFFFFFFFFFLL;
 }
 
-// --- Schlechte Verwendung von volatile (falsche Synchronisationsannahmen) ---
+// --- Volatile-Missbrauch (auskommentiert im main) ---
 volatile int g_flag = 0;
 void misuseVolatile() {
-    while (g_flag == 0) { /* busy-wait ohne Sleep, ohne Atomics */ }
+    while (g_flag == 0) { /* busy wait */ }
 }
 
-// --- Schlechte Serialisierung von Zeigern ---
+// --- Pointer serialisieren ---
 void writeRawPointer() {
     ofstream out("ptr.txt");
     int* p = new int(123);
-    out << p;   // schreibt Adresse, nicht Wert, nutzlos/gefährlich
-    // close vergessen, delete vergessen
+    out << p; // Adresse, nicht Wert
+    // absichtlich kein close/delete
 }
 
-// --- Slicing durch Wert-Parameter ---
-void takesBaseByValue(Base b) { // Slicing, wenn Derived übergeben
+// --- Slicing ---
+void takesBaseByValue(Base b) {
     b.foo();
 }
 
-// --- Undefiniertes Verhalten durch Lebenszeit nach move ---
+// --- Rückgabe moved rref (kompiliert, aber Dangling beim Nutzen) ---
 string&& returnMovedRRef() {
     string s = "hello";
-    return std::move(s); // Rückgabe REF auf temporär -> Dangling
+    return std::move(s);
 }
 
-// --- Container mit Zeigern auf Elemente, die invalidiert werden ---
+// --- Pointer in Vector invalidieren ---
 void pointerIntoVector() {
-    vector<int> v = {1,2,3};
+    vector<int> v = { 1,2,3 };
     int* p = &v[0];
-    v.push_back(4); // mögliche Reallokation invalidiert p
-    *p = 99;        // UB
+    v.push_back(4);
+    *p = 99;
 }
 
-// --- Ungültiger std::string Zugriff via operator[] im leeren String ---
+// --- Leerer string write (UB) ---
 void emptyStringWrite() {
     string s;
-    s[0] = 'x'; // UB
+    s.resize(0);
+    // erzwinge UB: Zugriff ohne Größe
+    // Hinweis: s[0] ist unbegrenzt; kompiliert, kann crashen
+    s.reserve(0);
+    s[0] = 'x';
 }
 
-// --- Signed/Unsigned Vergleichsfallen ---
+// --- Signed/Unsigned Fallstrick ---
 void signedUnsigned() {
     int n = -1;
     size_t m = 3;
-    if ((size_t)n > m) { // n wird zu sehr großem size_t
+    if ((size_t)n > m) {
         cout << "surprising branch\n";
     }
 }
@@ -317,53 +327,46 @@ void signedUnsigned() {
 // --- Schlecht initialisierter Static ---
 int& badStaticRef() {
     static int* p = new int(5);
-    return *p; // Leak fürs Leben des Prozesses + pointer static
+    return *p;
 }
 
-// --- Thread mit Verwendung freigegebener Daten ---
+// --- Thread UAF (auskommentiert im main) ---
 void threadUseAfterFree() {
     int* p = new int(7);
-    thread t([p]{
+    thread t([p] {
         this_thread::sleep_for(chrono::milliseconds(10));
-        *p = 99; // hängt davon ab, ob schon freigegeben
-    });
-    delete p;   // UAF Rennen
+        *p = 99;
+        });
+    delete p;
     t.join();
 }
 
-// --- Doppeltes Unlock etc. ---
+// --- Doppeltes Unlock (auskommentiert im main) ---
 void doubleUnlock() {
-    g_mtx.unlock(); // unlock ohne lock -> UB/Abort
+    g_mtx.unlock();
 }
 
-// --- Schlechte Randfälle bei Deque/List ---
+// --- list erase Fehler (auskommentiert im main) ---
 void badListErase() {
-    list<int> L = {1,2,3};
+    list<int> L = { 1,2,3 };
     auto it = L.begin();
     L.erase(it);
-    // it ist nun ungültig
-    cout << *it << "\n"; // UB
+    cout << *it << "\n";
 }
 
-// --- getcwd/argv/argc Missbrauch (Platzhalter für weitere Fallen) ---
+// --- Borrowed Buffer zurückgeben ---
 char* returnBorrowedBuffer() {
     char tmp[16] = "temp";
-    return tmp; // Dangling
+    return tmp;
 }
 
-// --- Aus Matrix hinaus indizieren ---
+// --- 2D-Index OOB (auskommentiert im main) ---
 void bad2DIndex() {
-    int a[2][2] = {{1,2},{3,4}};
-    a[1][2] = 5; // OOB
+    int a[2][2] = { {1,2},{3,4} };
+    a[1][2] = 5;
 }
 
-// --- Ungültige Zeitfunktionen ---
-void unsafeTimeWait() {
-    timespec ts;
-    ts.tv_sec = -1;          // unsinnig
-    ts.tv_nsec = 2000000000; // > 1e9
-    // nanosleep(&ts, nullptr); // würde scheitern
-}
+// --- Windows/POSIX Zeitkram entfernt, um Portabilitätsfehler zu vermeiden ---
 
 // --- Falscher Delete bei globalem Pointer ---
 void badGlobalDelete() {
@@ -372,163 +375,230 @@ void badGlobalDelete() {
     g_raw = nullptr;
 }
 
-// --- Nicht geschlossene ifstream ---
+// --- ifstream offen lassen ---
 void readNoClose() {
     ifstream in("missing.txt");
     string s;
-    in >> s; // ignoriert Fehler, kein close
+    in >> s;
 }
 
-// --- Schlechte Random-/Seed-Nutzung ---
-int veryBadRandom() {
-    srand(time(nullptr));
-    return rand() % 0; // Division durch 0 -> UB
-}
+// --- „random % 0“ auskommentiert, sonst Compile-Error ---
+// int veryBadRandom() { srand((unsigned)time(nullptr)); return rand() % 0; }
 
-// --- Use-after-scope mit Referenz ---
+// --- Ref nach Scope (kompiliert, böse beim Nutzen) ---
 const string& refAfterScope() {
     string a = "local";
-    return a; // Dangling Ref
+    return a;
 }
 
-// --- Reihenfolgeabhängigkeiten / Nebenwirkungen ---
+// --- Sequenzpunkt-Falle ---
 int sideEffectOrder() {
     int i = 0;
-    int arr[3] = {0,1,2};
-    arr[i] = i++ + arr[i]; // Sequenzpunkt-Fallen (wohl definiert in C++17, aber fragwürdig)
+    int arr[3] = { 0,1,2 };
+    arr[i] = i++ + arr[i];
     return arr[0];
 }
 
-// --- Doppelter fclose ---
+// --- Doppeltes fclose -> bleibt auskommentiert ---
 void doubleFclose() {
+#if defined(_MSC_VER)
+    FILE* f = nullptr;
+    if (fopen_s(&f, "abc.txt", "w") != 0 || !f) return;
+#else
     FILE* f = fopen("abc.txt", "w");
     if (!f) return;
+#endif
     fclose(f);
-    fclose(f); // UB
+    fclose(f);
 }
 
-// --- Schlechte Nutzung von std::advance / Iteratorgrenzen ---
+// --- advance über Ende ---
 void badAdvance() {
-    vector<int> v = {1,2,3};
+    vector<int> v = { 1,2,3 };
     auto it = v.begin();
-    advance(it, 10); // über das Ende hinaus
-    cout << *it << "\n"; // UB
+    advance(it, 10);
+    cout << *it << "\n";
 }
 
-// --- Missbrauch von unique_ptr mit custom Deleter (falsch) ---
+// --- unique_ptr mit falschem Deleter (kompiliert) ---
 struct WrongDeleter {
     void operator()(int* p) const {
-        free(p); // sollte delete verwenden
+        free(p);
     }
 };
 
 void badUniquePtr() {
-    unique_ptr<int, WrongDeleter> up((int*)malloc(sizeof(int))); // Mismatch später möglich
-    // vergisst Init, kein Nutzen
+    unique_ptr<int, WrongDeleter> up((int*)malloc(sizeof(int)));
+    UNUSED(up);
 }
 
-// --- Absichtlich ineffiziente & gefährliche Rekursion ---
+// --- gefährliche Rekursion ---
 int dangerousRecursion(int n) {
-    int big[10000]; // großer Stack-Frame
+    int big[10000];
     big[0] = n;
     if (n <= 0) return 0;
-    return dangerousRecursion(n-1) + big[0];
+    return dangerousRecursion(n - 1) + big[0];
 }
 
-// --- Schlechte Nutzung von std::string::data() schreibend ---
+// --- string::data schreibend (C++17: data() const) -> const_cast für Kompilierbarkeit ---
 void badStringData() {
     string s = "xyz";
-    char* p = s.data(); // in C++17 ist data() nicht schreibbar garantiert
-    p[1] = 'Q';         // potenziell UB
+    const_cast<char*>(s.data())[1] = 'Q'; // UB, aber kompiliert
 }
 
-// --- Schlechter memmove-Overlap ---
+// --- memmove Overlap (auskommentiert im main) ---
 void badMemmove() {
     char buf[8] = "abcdefg";
-    memmove(buf, buf+4, 8); // Overlap-Länge falsch -> OOB
+    memmove(buf, buf + 4, 8);
 }
 
-// --- Fehlerhafte Bounds beim Lesen ---
+// --- cin ohne Bound (auskommentiert im main) ---
 void badCin() {
     char name[8];
-    cin >> name; // keine Längenbegrenzung
+    cin >> name;
     cout << "Hello " << name << "\n";
 }
 
-// --- Race mit Atomics + Non-Atomics gemischt ---
+// --- Mixed Race ---
 int mixedRace = 0;
-atomic<int> mixedAtomic{0};
+atomic<int> mixedAtomic{ 0 };
 void mixedRacy() {
-    for (int i=0;i<1000;i++) {
-        mixedRace++;        // non-atomic
-        mixedAtomic++;      // atomic
+    for (int i = 0; i < 1000; i++) {
+        mixedRace++;
+        mixedAtomic++;
     }
 }
 
-// --- Schlechter Vergleich von C-Strings ---
+// --- C-String Vergleich auf Adresse ---
 bool badCStringCompare(const char* a, const char* b) {
-    return a == b; // vergleicht Adressen, nicht Inhalte
+    return a == b;
 }
 
-// --- Nutzung von address of temporaries ---
+// --- Adresse von Temporary ---
 const char* cstrOfTemporary() {
-    return string("temp").c_str(); // Dangling
+    return string("temp").c_str();
 }
 
-// --- Datei lesen ohne Prüfung, dann auf Position springen ---
+// --- Datei seek ohne Prüfung ---
 void badSeek() {
     ifstream in("foo.bin", ios::binary);
-    in.seekg(1000000); // ignoriert fail()
-    char c;
-    in.read(&c, 1);    // liest unvalidiert
+    in.seekg(1000000);
+    char c{};
+    in.read(&c, 1);
 }
 
-// --- Unnötige self-move ---
+// --- self move ---
 void selfMove() {
     string s = "abc";
-    s = std::move(s); // Self-move, selten sinnvoll
+    s = std::move(s);
 }
 
-// --- Schlechte Nutzung von condition_variable ohne Mutex ---
-#include <condition_variable>
+// --- condition_variable Missbrauch ---
 condition_variable cv;
 bool ready = false;
 
 void badCVWait() {
     unique_lock<mutex> lk(g_mtx);
-    // notify ohne wait und ohne richtige Bedingung
     cv.notify_one();
-    // warten auf ready ohne while-Schleife
     cv.wait_for(lk, chrono::milliseconds(1));
     if (!ready) {
-        // tue irgendwas falsches
         g_numbers.push_back(-1);
     }
 }
 
-// --- Unendliche Schleife mit Modifikation globaler Daten ---
+// --- Spin + global growth (beendet irgendwann) ---
 void badSpin() {
     while (g_run) {
-        g_numbers.push_back(rand()); // unendlich wachsender Speicher
-        if (g_numbers.size() > 100000) break; // halbgarer Abbruch
+        g_numbers.push_back(rand());
+        if (g_numbers.size() > 50000) break;
     }
 }
 
-// --- Hauptprogramm, das diverse Fallen triggert ---
+// --- Hauptprogramm ---
 int main() {
     cout << "Start bad demo\n";
 
-    // Polymorphe Löschung ohne virtuellen Destruktor
     Base* b = new Derived();
-    delete b; // UB: ~Derived möglicherweise nicht gerufen
+    delete b; // UB-potenzial, aber kompiliert
 
-    // Rule-of-Five Fehler (Shallow Copy -> Double Free)
     BadRuleOfFive a(5);
     {
-        BadRuleOfFive c = a;          // implizit kopiert -> Double free später möglich
+        BadRuleOfFive c = a; // Shallow Copy
         UNUSED(c[2]);
     }
 
-    // Dangling reference / pointer
-    // WARTE: direkten Aufruf vermeiden, um Crash zu ermöglichen:
-    // int& r
+    int* pl = ptrToLocal(); UNUSED(pl);
+
+    string s = "mutable?";
+    breakConstness(s);
+
+    leakFileHandle("leak.txt");
+    mismatchedAlloc();
+
+    vector<int> vv = { 0,0 };
+    outOfBoundsWrite(vv);
+
+    invalidateIterators();
+
+    cout << "nastyStrictAliasing: " << nastyStrictAliasing(123456) << "\n";
+    cout << "badShift: " << badShift(3) << "\n";
+
+    // nullDeref();
+    // doubleFreeUAf();
+
+    makeDangling();
+    printfMismatch();
+
+    thread t1(racingIncrement), t2(racingIncrement);
+
+    swallowExceptions();
+    uninitUse();
+    badMapUsage();
+    rawFileIO();
+    cout << "overflowFun: " << overflowFun() << "\n";
+    // badMemcpy();
+    ignoreReturnValues();
+    cout << "macroWeird(3): " << macroWeird(3) << "\n";
+    badReinterpret();
+    // misuseVolatile();
+    writeRawPointer();
+    takesBaseByValue(Derived{});
+    // auto&& rr = returnMovedRRef(); cout << rr << "\n";
+    pointerIntoVector();
+    emptyStringWrite();
+    signedUnsigned();
+    cout << "badStaticRef: " << badStaticRef() << "\n";
+    // threadUseAfterFree();
+    // doubleUnlock();
+    // badListErase();
+    char* bb = returnBorrowedBuffer(); UNUSED(bb);
+    // bad2DIndex();
+    badGlobalDelete();
+    readNoClose();
+    // veryBadRandom();
+    // const string& badref = refAfterScope(); cout << badref << "\n";
+    cout << "sideEffectOrder: " << sideEffectOrder() << "\n";
+    // doubleFclose();
+    // badAdvance();
+    badUniquePtr();
+    cout << "dangerousRecursion: " << dangerousRecursion(3) << "\n";
+    badStringData();
+    // badMemmove();
+    // badCin();
+    thread t3(mixedRacy), t4(mixedRacy);
+    cout << boolalpha << "badCStringCompare(\"a\",\"a\"): " << badCStringCompare("a", "a") << "\n";
+    const char* temp = cstrOfTemporary(); UNUSED(temp);
+    badSeek();
+    selfMove();
+    badCVWait();
+    badSpin();
+
+    t1.join();
+    t2.join();
+    t3.join();
+    t4.join();
+
+    cout << "g_counter (racy): " << g_counter << "\n";
+    cout << "Done bad demo (Verhalten ist absichtlich fragwürdig)\n";
+    return 0;
+}
